@@ -156,8 +156,34 @@ def do_install(chat_id, s):
         sessions.pop(chat_id, None)
         return
     pid = res.get("projectId", "?")
-    send(chat_id, f"✅ پروژه ساخته شد!\n🆔 <code>{ihtml.escape(str(pid))}</code>\n\n📦 حالا باید فایل بوت‌استرپ رو دیپلوی کنی — لینک پروژه:\nhttps://app.zerops.io/project/{pid}\n\n⚠️ مرحله بعد: فایل bootstrap.sh (همراه ربات) رو تو سرویس app آپلود کن و دیپلوی بزن. نصب هرمس ~۵-۱۰ دقیقه طول می‌کشه.")
+    send(chat_id, f"✅ پروژه ساخته شد!\n🆔 <code>{ihtml.escape(str(pid))}</code>\n\n🔗 لینک پروژه:\nhttps://app.zerops.io/project/{pid}\n\n⏳ سرویس app داره از روی تمپلیت بیلد می‌گیره (~۵ دقیقه). کاری لازم نیست بکنی — وقتی بالا اومد خبرت می‌کنم.")
     sessions.pop(chat_id, None)
+    threading.Thread(target=watch_deploy, args=(chat_id, zt, pid), daemon=True).start()
+
+
+def watch_deploy(chat_id, token, pid, tries=40):
+    """Poll service status; notify when running or failed."""
+    import time as _t
+    sid = None
+    for _ in range(tries):
+        _t.sleep(60)
+        try:
+            _, data = zapi(token, "get", f"/project/{pid}/service-stack", timeout=30)
+            items = data.get("list", []) if isinstance(data, dict) else []
+            for s in items:
+                if s.get("isSystem"):
+                    continue
+                sid = s.get("id")
+                st = s.get("status", "?")
+                if st in ("READY", "RUNNING", "OK") or "RUN" in st.upper():
+                    send(chat_id, f"🎉 هرمس بالا اومد!\nلینک سرویس:\nhttps://app.zerops.io/project/{pid}\n\nتوکن بات هرمست رو تو تلگرام باز کن و /start بزن.")
+                    return
+                if "FAIL" in st.upper() or "ERROR" in st.upper():
+                    send(chat_id, f"❌ دیپلوی fail شد (وضعیت: {st}). لاگ رو تو داشبورد ببین یا بگو برات چک کنم.")
+                    return
+        except Exception:
+            pass
+    send(chat_id, "⏰ هنوز بالا نیومده بعد ~۴۰ دقیقه. وضعیت رو تو داشبورد چک کن:\nhttps://app.zerops.io/project/" + str(pid))
 
 
 def handle(chat_id, text):
