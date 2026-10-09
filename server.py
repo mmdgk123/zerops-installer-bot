@@ -175,7 +175,7 @@ def watch_deploy(chat_id, token, pid, tries=40):
                     continue
                 sid = s.get("id")
                 st = s.get("status", "?")
-                if st in ("READY", "RUNNING", "OK") or "RUN" in st.upper():
+                if st in ("READY", "RUNNING", "OK", "ACTIVE") or "RUN" in st.upper():
                     send(chat_id, f"🎉 هرمس بالا اومد!\nلینک سرویس:\nhttps://app.zerops.io/project/{pid}\n\nتوکن بات هرمست رو تو تلگرام باز کن و /start بزن.")
                     return
                 if "FAIL" in st.upper() or "ERROR" in st.upper():
