@@ -73,10 +73,15 @@ zerops:
   corePackage: LIGHT
 services:
   - hostname: app
-    type: ubuntu@24.04
+    type: nodejs@22
     enableSubdomainAccess: true
     minContainers: 1
     maxContainers: 1
+    # 1GB RAM: npm install 9router OOMs on the 128MB default
+    minRam: 1
+    maxRam: 1
+    minCpu: 1
+    maxCpu: 2
     buildFromGit: https://github.com/mmdgk123/hermes-zerops-template
     dotEnvSecrets: |
 {dg}
