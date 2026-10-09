@@ -65,10 +65,11 @@ services:
 """
 
 
-def build_hermes_yaml(tg_token, chat_id, router_key):
+def build_hermes_yaml(tg_token, chat_id, router_url, router_key):
     dotenv = (
         f"NEW_TG_TOKEN={tg_token}\n"
         f"NEW_TG_CHAT={chat_id}\n"
+        f"ROUTER_URL={router_url}\n"
         f"ROUTER_KEY={router_key}\n"
     )
     dg = "\n".join("      " + l for l in dotenv.strip().split("\n"))
@@ -137,10 +138,10 @@ def watch_router(chat_id, token, pid, tries=40):
                     continue
                 st = sv.get("status", "?")
                 if st in ("READY", "RUNNING", "OK", "ACTIVE") or "RUN" in st.upper():
-                    send(chat_id, f"🔀 9router بالا اومد!\n\nداشبورد:\nhttps://app.zerops.io/project/{pid}\n(سرویس router → ساب‌دامین → /dashboard، پسورد اول: 123456)\n\nکلید API رو از داشبورد بگیر (بخش API keys) و همین‌جا بفرست تا هرمس رو نصب کنم:")
+                    send(chat_id, f"🔀 9router بالا اومد!\n\nلینک داشبورد:\nhttps://app.zerops.io/project/{pid}\n(سرویس router → ساب‌دامین → /dashboard، پسورد اول: 123456)\n\n<b>مرحله ۲:</b> اول لینک لوکال 9router رو بفرست (ساب‌دامین سرویس router + /v1، مثل https://router-xxx.prg1.zerops.app/v1):")
                     s = sessions.get(chat_id)
                     if s is not None:
-                        s["step"] = "rkey"
+                        s["step"] = "rurl"
                     return
                 if "FAIL" in st.upper() or "ERROR" in st.upper():
                     send(chat_id, f"❌ بیلد 9router خراب شد ({st}). لاگ رو تو داشبورد ببین.")
@@ -152,11 +153,12 @@ def watch_router(chat_id, token, pid, tries=40):
 
 
 def phase2_hermes(chat_id, s):
-    """Import hermes service into the same project with the router key."""
+    """Import hermes service into the same project with the router URL+key."""
     zt, pid = s["zerops_token"], s["pid"]
-    send(chat_id, "⏳ کلید رو گرفتم، دارم هرمس رو نصب می‌کنم… (مرحله ۲ از ۲)")
+    send(chat_id, "⏳ لینک و کلید رو گرفتم، دارم هرمس رو نصب می‌کنم… (مرحله ۳ از ۳)")
     code, res = zapi(zt, "post", f"/project/{pid}/service-stack/import",
-                     {"yaml": build_hermes_yaml(s["tg_token"], chat_id, s["router_key"])},
+                     {"yaml": build_hermes_yaml(s["tg_token"], chat_id,
+                                                s.get("router_url", ""), s.get("router_key", ""))},
                      timeout=120)
     if code != 200:
         send(chat_id, f"❌ ساخت سرویس هرمس ناموفق بود (HTTP {code}):\n<code>" +
@@ -247,6 +249,15 @@ def handle(chat_id, text):
         threading.Thread(target=phase1_router, args=(chat_id, dict(s)), daemon=True).start()
         # keep live session ref for step transition
         sessions[chat_id] = s
+        return
+    if step == "rurl":
+        url = text.strip().rstrip("/")
+        if not url.startswith("http"):
+            send(chat_id, "❌ لینک باید با http شروع بشه. دوباره بفرست:")
+            return
+        s["router_url"] = url
+        s["step"] = "rkey"
+        send(chat_id, "✅ لینک گرفتم.\n\n<b>مرحله ۳:</b> حالا کلید API رو از داشبورد 9router بگیر (بخش API keys) و بفرست:")
         return
     if step == "rkey":
         if len(text) < 10:
