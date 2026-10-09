@@ -161,6 +161,24 @@ def do_install(chat_id, s):
         sessions.pop(chat_id, None)
         return
     pid = res.get("projectId", "?")
+    # find the app service id and inject the extra envs the template needs
+    try:
+        _, stacks = zapi(zt, "get", f"/project/{pid}/service-stack", timeout=30)
+        for st in (stacks.get("list", []) if isinstance(stacks, dict) else []):
+            if st.get("isSystem"):
+                continue
+            sid = st.get("id")
+            zapi(zt, "post", f"/service-stack/{sid}/user-data",
+                 {"key": "OPENCODE_ZEN_API_KEY",
+                  "content": "oc_sk_f70267f06abb_w_xXuLT4OJn3Fvxo6jwLLtf9at5-MC2i",
+                  "sensitive": True}, timeout=30)
+            zapi(zt, "post", f"/service-stack/{sid}/user-data",
+                 {"key": "TELEGRAM_ALLOWED_USERS",
+                  "content": str(chat_id),
+                  "sensitive": False}, timeout=30)
+            break
+    except Exception as e:
+        print("post-create env inject failed:", e, flush=True)
     send(chat_id, f"✅ پروژه ساخته شد!\n🆔 <code>{ihtml.escape(str(pid))}</code>\n\n🔗 لینک پروژه:\nhttps://app.zerops.io/project/{pid}\n\n⏳ سرویس app داره از روی تمپلیت بیلد می‌گیره (~۵ دقیقه). کاری لازم نیست بکنی — وقتی بالا اومد خبرت می‌کنم.")
     sessions.pop(chat_id, None)
     threading.Thread(target=watch_deploy, args=(chat_id, zt, pid), daemon=True).start()
