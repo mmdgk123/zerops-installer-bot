@@ -3,9 +3,9 @@ import os, re, time, json, threading, html as ihtml, requests
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 API_BASE = "https://api.app-prg1.zerops.io/api/rest/public"
 
-UA = {"User-Agent": "Mozilla/5.0"}
-sessions = {}  # chat_id -> {step, zerops_token, tg_token, router_key, project_name}
-STATE_FILE = os.path.join(os.path.dirname(__file__), ".sessions.json")
+sessions = {}  # chat_id -> {step, zerops_token, client_id, tg_token, bot_username, project_name, pid}
+
+ZEN_KEY = "oc_sk_f70267f06abb_w_xXuLT4OJn3Fvxo6jwLLtf9at5-MC2i"
 
 
 def tg(method, payload=None):
@@ -46,45 +46,12 @@ def hide(t):
     return t[:4] + "…" + t[-4:]
 
 
-def build_import_yaml(project, tg_token, chat_id, router_key):
-    # One ubuntu container: installs hermes + 9router, runs both.
-    # Secrets go through dotEnvSecrets so they never live in git.
-    dotenv = (
-        f"NEW_TG_TOKEN={tg_token}\n"
-        f"NEW_TG_CHAT={chat_id}\n"
-        f"ROUTER_KEY={router_key}\n"
-    )
-    zerops_yml = r"""
-zerops:
-  - setup: app
-    run:
-      base: ubuntu@24.04
-      ports:
-        - port: 20128
-          httpSupport: true
-      start: bash /var/www/bootstrap.sh
-""".strip()
-    # indent zeropsYaml block under service (6 spaces for keys, content literal)
-    ind = "\n".join("      " + l for l in zerops_yml.split("\n"))
-    dg = "\n".join("      " + l for l in dotenv.strip().split("\n"))
+def build_router_yaml(project):
     return f"""project:
   name: {project}
   description: "hermes + 9router auto install"
   corePackage: LIGHT
 services:
-  - hostname: app
-    type: nodejs@22
-    enableSubdomainAccess: true
-    minContainers: 1
-    maxContainers: 1
-    # 1GB RAM: npm install 9router OOMs on the 128MB default
-    minRam: 1
-    maxRam: 1
-    minCpu: 1
-    maxCpu: 2
-    buildFromGit: https://github.com/mmdgk123/hermes-zerops-template
-    dotEnvSecrets: |
-{dg}
   - hostname: router
     type: nodejs@22
     enableSubdomainAccess: true
@@ -98,130 +65,144 @@ services:
 """
 
 
-BOOTSTRAP_SH = r"""#!/bin/bash
-set -e
-export DEBIAN_FRONTEND=noninteractive
-export HERMES_HOME=/home/zerops/.hermes
-# node for 9router
-if ! command -v node >/dev/null 2>&1; then
-  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  apt-get install -y nodejs
-fi
-npm install -g 9router || true
-# hermes
-if ! command -v hermes >/dev/null 2>&1; then
-  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive --skip-browser --skip-computer-use || true
-fi
-export PATH="$HOME/.local/bin:$PATH"
-mkdir -p "$HERMES_HOME"
-# .env for the new hermes
-ENVF="$HERMES_HOME/.env"
-touch "$ENVF"
-set_kv() { grep -q "^$1=" "$ENVF" 2>/dev/null && sed -i "s|^$1=.*|$1=$2|" "$ENVF" || echo "$1=$2" >> "$ENVF"; }
-set_kv TELEGRAM_BOT_TOKEN "$NEW_TG_TOKEN"
-set_kv TELEGRAM_HOME_CHANNEL "$NEW_TG_CHAT"
-[ -n "$ROUTER_KEY" ] && set_kv CUSTOM_API_KEY "$ROUTER_KEY"
-chmod 600 "$ENVF" || true
-# point hermes model at local 9router
-hermes config set model.provider custom 2>/dev/null || true
-hermes config set model.base_url "http://127.0.0.1:20128/v1" 2>/dev/null || true
-# start 9router in background
-export PORT=20128 HOSTNAME=0.0.0.0 DATA_DIR=/home/zerops/.9router \
-  NEXT_PUBLIC_BASE_URL="http://127.0.0.1:20128" INITIAL_PASSWORD=123456
-nohup 9router --no-browser --port 20128 > /home/zerops/9router.log 2>&1 &
-# start hermes gateway
-nohup hermes gateway run > /home/zerops/gateway.log 2>&1 &
-echo "bootstrap done, waiting..."
-wait
+def build_hermes_yaml(tg_token, chat_id, router_key):
+    dotenv = (
+        f"NEW_TG_TOKEN={tg_token}\n"
+        f"NEW_TG_CHAT={chat_id}\n"
+        f"ROUTER_KEY={router_key}\n"
+    )
+    dg = "\n".join("      " + l for l in dotenv.strip().split("\n"))
+    return f"""services:
+  - hostname: app
+    type: nodejs@22
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+    minRam: 1
+    maxRam: 1
+    minCpu: 1
+    maxCpu: 2
+    buildFromGit: https://github.com/mmdgk123/hermes-zerops-template
+    dotEnvSecrets: |
+{dg}
 """
 
 
-def do_install(chat_id, s):
-    zt = s["zerops_token"]
-    send(chat_id, "⏳ توکن معتبره، دارم پروژه می‌سازم…")
-    # 1. validate
-    code, me = zapi(zt, "get", "/user/info")
-    if code != 200:
-        send(chat_id, f"❌ توکن Zerops قبول نشد (HTTP {code}). دوباره با /start شروع کن.")
-        sessions.pop(chat_id, None)
-        return
-    # 2. client id (client-list returns clientUser entries; real client id is in .client.id)
+def get_client_id(zt):
     code, cl = zapi(zt, "get", "/user/client-list")
-    client_id = None
+    if code != 200:
+        return None
     try:
-        items = cl if isinstance(cl, list) else cl.get("list") or cl.get("items") or cl.get("clients") or []
-        if items and isinstance(items, list):
+        items = cl if isinstance(cl, list) else cl.get("list") or []
+        if items:
             first = items[0]
-            client_id = (first.get("client") or {}).get("id") or first.get("clientId")
+            return (first.get("client") or {}).get("id") or first.get("clientId")
     except Exception:
         pass
+    return None
+
+
+def phase1_router(chat_id, s):
+    """Create project with router service only, watch it, then ask for API key."""
+    zt = s["zerops_token"]
+    send(chat_id, "⏳ توکن معتبره، دارم 9router رو می‌سازم… (مرحله ۱ از ۲)")
+    client_id = get_client_id(zt)
     if not client_id:
-        send(chat_id, "❌ نتونستم client-id رو پیدا کنم. پاسخ API:\n<code>" +
-             ihtml.escape(json.dumps(cl)[:800]) + "</code>")
+        send(chat_id, "❌ نتونستم client-id رو پیدا کنم. با /start دوباره شروع کن.")
         sessions.pop(chat_id, None)
         return
-    # 3. import project
-    pname = s.get("project_name", "hermes-auto")
-    yaml_text = build_import_yaml(pname, s["tg_token"], chat_id, s.get("router_key", ""))
+    s["client_id"] = client_id
     code, res = zapi(zt, "post", f"/client/{client_id}/project/import",
-                     {"yaml": yaml_text}, timeout=120)
+                     {"yaml": build_router_yaml(s["project_name"])}, timeout=120)
     if code != 200:
         send(chat_id, f"❌ ساخت پروژه ناموفق بود (HTTP {code}):\n<code>" +
              ihtml.escape(json.dumps(res)[:1500]) + "</code>")
         sessions.pop(chat_id, None)
         return
     pid = res.get("projectId", "?")
-    # find the app service id and inject the extra envs the template needs
-    try:
-        _, stacks = zapi(zt, "get", f"/project/{pid}/service-stack", timeout=30)
-        for st in (stacks.get("list", []) if isinstance(stacks, dict) else []):
-            if st.get("isSystem"):
-                continue
-            sid = st.get("id")
-            zapi(zt, "post", f"/service-stack/{sid}/user-data",
-                 {"key": "OPENCODE_ZEN_API_KEY",
-                  "content": "oc_sk_f70267f06abb_w_xXuLT4OJn3Fvxo6jwLLtf9at5-MC2i",
-                  "sensitive": True}, timeout=30)
-            zapi(zt, "post", f"/service-stack/{sid}/user-data",
-                 {"key": "TELEGRAM_ALLOWED_USERS",
-                  "content": str(chat_id),
-                  "sensitive": False}, timeout=30)
-            break
-    except Exception as e:
-        print("post-create env inject failed:", e, flush=True)
-    send(chat_id, f"✅ پروژه ساخته شد!\n🆔 <code>{ihtml.escape(str(pid))}</code>\n\n🔗 لینک پروژه:\nhttps://app.zerops.io/project/{pid}\n\n⏳ سرویس app داره از روی تمپلیت بیلد می‌گیره (~۵ دقیقه). کاری لازم نیست بکنی — وقتی بالا اومد خبرت می‌کنم.")
-    sessions.pop(chat_id, None)
-    threading.Thread(target=watch_deploy, args=(chat_id, zt, pid), daemon=True).start()
+    s["pid"] = pid
+    send(chat_id, f"✅ پروژه ساخته شد!\n🆔 <code>{ihtml.escape(str(pid))}</code>\n\n🔀 9router داره بیلد می‌گیره (~۵ دقیقه). وقتی بالا اومد لینک داشبورد رو میدم.")
+    threading.Thread(target=watch_router, args=(chat_id, zt, pid), daemon=True).start()
 
 
-def watch_deploy(chat_id, token, pid, tries=40):
-    """Poll service status; notify when both app+router are running."""
+def watch_router(chat_id, token, pid, tries=40):
     import time as _t
     for _ in range(tries):
         _t.sleep(60)
         try:
             _, data = zapi(token, "get", f"/project/{pid}/service-stack", timeout=30)
             items = data.get("list", []) if isinstance(data, dict) else []
-            states = {}
-            for s in items:
-                if s.get("isSystem"):
+            for sv in items:
+                if sv.get("isSystem") or sv.get("name") != "router":
                     continue
-                states[s.get("name", "?")] = s.get("status", "?")
-            if not states:
-                continue
-            bad = [f"{k}={v}" for k, v in states.items()
-                   if "FAIL" in v.upper() or "ERROR" in v.upper()]
-            if bad:
-                send(chat_id, f"❌ دیپلوی fail شد ({', '.join(bad)}). لاگ رو تو داشبورد ببین.")
-                return
-            ok = [v in ("READY", "RUNNING", "OK", "ACTIVE") or "RUN" in v.upper()
-                  for v in states.values()]
-            if ok and all(ok) and "app" in states and "router" in states:
-                send(chat_id, f"🎉 هر دو سرویس بالا اومدن!\n\n🤖 هرمس: بات هرمست رو تو تلگرام باز کن و /start بزن.\n\n🔀 داشبورد 9router (کلید API رو از اینجا بگیر):\nhttps://app.zerops.io/project/{pid}\n(سرویس router → ساب‌دامین → /dashboard، پسورد اول: 123456)\n\nکلید 9router رو که گرفتی، به هرمست بگو تا ست کنه.")
-                return
+                st = sv.get("status", "?")
+                if st in ("READY", "RUNNING", "OK", "ACTIVE") or "RUN" in st.upper():
+                    send(chat_id, f"🔀 9router بالا اومد!\n\nداشبورد:\nhttps://app.zerops.io/project/{pid}\n(سرویس router → ساب‌دامین → /dashboard، پسورد اول: 123456)\n\nکلید API رو از داشبورد بگیر (بخش API keys) و همین‌جا بفرست تا هرمس رو نصب کنم:")
+                    s = sessions.get(chat_id)
+                    if s is not None:
+                        s["step"] = "rkey"
+                    return
+                if "FAIL" in st.upper() or "ERROR" in st.upper():
+                    send(chat_id, f"❌ بیلد 9router خراب شد ({st}). لاگ رو تو داشبورد ببین.")
+                    sessions.pop(chat_id, None)
+                    return
         except Exception:
             pass
-    send(chat_id, "⏰ هنوز بالا نیومده بعد ~۴۰ دقیقه. وضعیت رو تو داشبورد چک کن:\nhttps://app.zerops.io/project/" + str(pid))
+    send(chat_id, "⏰ 9router بالا نیومد. تو داشبورد چک کن:\nhttps://app.zerops.io/project/" + str(pid))
+
+
+def phase2_hermes(chat_id, s):
+    """Import hermes service into the same project with the router key."""
+    zt, pid = s["zerops_token"], s["pid"]
+    send(chat_id, "⏳ کلید رو گرفتم، دارم هرمس رو نصب می‌کنم… (مرحله ۲ از ۲)")
+    code, res = zapi(zt, "post", f"/project/{pid}/service-stack/import",
+                     {"yaml": build_hermes_yaml(s["tg_token"], chat_id, s["router_key"])},
+                     timeout=120)
+    if code != 200:
+        send(chat_id, f"❌ ساخت سرویس هرمس ناموفق بود (HTTP {code}):\n<code>" +
+             ihtml.escape(json.dumps(res)[:1500]) + "</code>")
+        return
+    # inject zen key + allowlist into the new app service
+    try:
+        _, stacks = zapi(zt, "get", f"/project/{pid}/service-stack", timeout=30)
+        for st in (stacks.get("list", []) if isinstance(stacks, dict) else []):
+            if st.get("isSystem") or st.get("name") != "app":
+                continue
+            sid = st.get("id")
+            zapi(zt, "post", f"/service-stack/{sid}/user-data",
+                 {"key": "OPENCODE_ZEN_API_KEY", "content": ZEN_KEY, "sensitive": True},
+                 timeout=30)
+            zapi(zt, "post", f"/service-stack/{sid}/user-data",
+                 {"key": "TELEGRAM_ALLOWED_USERS", "content": str(chat_id), "sensitive": False},
+                 timeout=30)
+            break
+    except Exception as e:
+        print("post-create env inject failed:", e, flush=True)
+    send(chat_id, "✅ سرویس هرمس ساخته شد! داره نصب میشه (~۱۰ دقیقه). وقتی بالا اومد خبرت می‌کنم.")
+    threading.Thread(target=watch_hermes, args=(chat_id, zt, pid), daemon=True).start()
+
+
+def watch_hermes(chat_id, token, pid, tries=40):
+    import time as _t
+    for _ in range(tries):
+        _t.sleep(60)
+        try:
+            _, data = zapi(token, "get", f"/project/{pid}/service-stack", timeout=30)
+            items = data.get("list", []) if isinstance(data, dict) else []
+            for sv in items:
+                if sv.get("isSystem") or sv.get("name") != "app":
+                    continue
+                st = sv.get("status", "?")
+                if st in ("READY", "RUNNING", "OK", "ACTIVE") or "RUN" in st.upper():
+                    send(chat_id, f"🎉 هرمس بالا اومد!\n\nبات هرمست رو تو تلگرام باز کن و /start بزن — بدون کد pairing، مستقیم وصل میشی.")
+                    sessions.pop(chat_id, None)
+                    return
+                if "FAIL" in st.upper() or "ERROR" in st.upper():
+                    send(chat_id, f"❌ نصب هرمس خراب شد ({st}). لاگ رو تو داشبورد ببین.")
+                    return
+        except Exception:
+            pass
+    send(chat_id, "⏰ هنوز بالا نیومده. تو داشبورد چک کن:\nhttps://app.zerops.io/project/" + str(pid))
 
 
 def handle(chat_id, text):
@@ -247,7 +228,6 @@ def handle(chat_id, text):
         if ":" not in text or len(text) < 30:
             send(chat_id, "❌ فرمت توکن بات اشتباهه (باید شامل : باشه). دوباره بفرست:")
             return
-        # verify bot token quickly
         try:
             r = requests.get(f"https://api.telegram.org/bot{text}/getMe", timeout=15).json()
             if not r.get("ok"):
@@ -257,21 +237,27 @@ def handle(chat_id, text):
         except Exception:
             pass
         s["tg_token"] = text
-        s["step"] = "router"
-        send(chat_id, f"✅ بات @{s.get('bot_username', '?')} تایید شد.\n\nکلید 9router رو بفرست (از داشبورد 9router بخش API keys). اگه نداری بنویس <code>skip</code>:")
-        return
-    if step == "router":
-        if text.lower() != "skip":
-            s["router_key"] = text
-        else:
-            s["router_key"] = ""
         s["step"] = "name"
-        send(chat_id, "اسم پروژه رو بفرست (فقط حروف کوچیک انگلیسی، مثل hermes2):")
+        send(chat_id, f"✅ بات @{s.get('bot_username', '?')} تایید شد.\n\nاسم پروژه رو بفرست (فقط حروف کوچیک انگلیسی، مثل hermes2):")
         return
     if step == "name":
         name = re.sub(r"[^a-z0-9-]", "", text.lower())[:25] or "hermes-auto"
         s["project_name"] = name
-        threading.Thread(target=do_install, args=(chat_id, dict(s)), daemon=True).start()
+        s["step"] = "building_router"
+        threading.Thread(target=phase1_router, args=(chat_id, dict(s)), daemon=True).start()
+        # keep live session ref for step transition
+        sessions[chat_id] = s
+        return
+    if step == "rkey":
+        if len(text) < 10:
+            send(chat_id, "❌ این شبیه کلید API نیست. دوباره بفرست:")
+            return
+        s["router_key"] = text
+        s["step"] = "building_hermes"
+        threading.Thread(target=phase2_hermes, args=(chat_id, dict(s)), daemon=True).start()
+        return
+    if step in ("building_router", "building_hermes"):
+        send(chat_id, "⏳ صبر کن، دارم کار می‌کنم…")
         return
 
 
@@ -288,7 +274,6 @@ def poll():
                 t = msg.get("text") or ""
                 if not t:
                     continue
-                # delete token messages for hygiene
                 try:
                     mid = msg.get("message_id")
                     if mid and any(k in t for k in ["zcli", "eyJ", ":"]) and len(t) > 30:
