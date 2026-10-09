@@ -77,11 +77,9 @@ services:
     enableSubdomainAccess: true
     minContainers: 1
     maxContainers: 1
+    buildFromGit: https://github.com/mmdgk123/hermes-zerops-template
     dotEnvSecrets: |
 {dg}
-    zeropsSetup: app
-    zeropsYaml:
-{ind}
 """
 
 
