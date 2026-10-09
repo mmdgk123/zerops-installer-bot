@@ -85,6 +85,16 @@ services:
     buildFromGit: https://github.com/mmdgk123/hermes-zerops-template
     dotEnvSecrets: |
 {dg}
+  - hostname: router
+    type: nodejs@22
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+    minRam: 1
+    maxRam: 1
+    minCpu: 1
+    maxCpu: 2
+    buildFromGit: https://github.com/mmdgk123/ninerouter-zerops
 """
 
 
@@ -185,25 +195,30 @@ def do_install(chat_id, s):
 
 
 def watch_deploy(chat_id, token, pid, tries=40):
-    """Poll service status; notify when running or failed."""
+    """Poll service status; notify when both app+router are running."""
     import time as _t
-    sid = None
     for _ in range(tries):
         _t.sleep(60)
         try:
             _, data = zapi(token, "get", f"/project/{pid}/service-stack", timeout=30)
             items = data.get("list", []) if isinstance(data, dict) else []
+            states = {}
             for s in items:
                 if s.get("isSystem"):
                     continue
-                sid = s.get("id")
-                st = s.get("status", "?")
-                if st in ("READY", "RUNNING", "OK", "ACTIVE") or "RUN" in st.upper():
-                    send(chat_id, f"🎉 هرمس بالا اومد!\nلینک سرویس:\nhttps://app.zerops.io/project/{pid}\n\nتوکن بات هرمست رو تو تلگرام باز کن و /start بزن.")
-                    return
-                if "FAIL" in st.upper() or "ERROR" in st.upper():
-                    send(chat_id, f"❌ دیپلوی fail شد (وضعیت: {st}). لاگ رو تو داشبورد ببین یا بگو برات چک کنم.")
-                    return
+                states[s.get("name", "?")] = s.get("status", "?")
+            if not states:
+                continue
+            bad = [f"{k}={v}" for k, v in states.items()
+                   if "FAIL" in v.upper() or "ERROR" in v.upper()]
+            if bad:
+                send(chat_id, f"❌ دیپلوی fail شد ({', '.join(bad)}). لاگ رو تو داشبورد ببین.")
+                return
+            ok = [v in ("READY", "RUNNING", "OK", "ACTIVE") or "RUN" in v.upper()
+                  for v in states.values()]
+            if ok and all(ok) and "app" in states and "router" in states:
+                send(chat_id, f"🎉 هر دو سرویس بالا اومدن!\n\n🤖 هرمس: بات هرمست رو تو تلگرام باز کن و /start بزن.\n\n🔀 داشبورد 9router (کلید API رو از اینجا بگیر):\nhttps://app.zerops.io/project/{pid}\n(سرویس router → ساب‌دامین → /dashboard، پسورد اول: 123456)\n\nکلید 9router رو که گرفتی، به هرمست بگو تا ست کنه.")
+                return
         except Exception:
             pass
     send(chat_id, "⏰ هنوز بالا نیومده بعد ~۴۰ دقیقه. وضعیت رو تو داشبورد چک کن:\nhttps://app.zerops.io/project/" + str(pid))
