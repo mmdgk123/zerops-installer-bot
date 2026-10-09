@@ -130,13 +130,14 @@ def do_install(chat_id, s):
         send(chat_id, f"❌ توکن Zerops قبول نشد (HTTP {code}). دوباره با /start شروع کن.")
         sessions.pop(chat_id, None)
         return
-    # 2. client id
+    # 2. client id (client-list returns clientUser entries; real client id is in .client.id)
     code, cl = zapi(zt, "get", "/user/client-list")
     client_id = None
     try:
         items = cl if isinstance(cl, list) else cl.get("list") or cl.get("items") or cl.get("clients") or []
         if items and isinstance(items, list):
-            client_id = items[0].get("id")
+            first = items[0]
+            client_id = (first.get("client") or {}).get("id") or first.get("clientId")
     except Exception:
         pass
     if not client_id:
