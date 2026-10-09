@@ -1,0 +1,10 @@
+services:
+- type: web
+  name: zerops-installer-bot
+  runtime: python
+  plan: free
+  buildCommand: pip install -r requirements.txt
+  startCommand: python server.py
+  envVars:
+  - key: BOT_TOKEN
+    sync: false
