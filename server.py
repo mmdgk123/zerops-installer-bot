@@ -3,9 +3,7 @@ import os, re, time, json, threading, html as ihtml, requests
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 API_BASE = "https://api.app-prg1.zerops.io/api/rest/public"
 
-sessions = {}  # chat_id -> {step, zerops_token, client_id, tg_token, bot_username, project_name, pid}
-
-ZEN_KEY = "oc_sk_f70267f06abb_w_xXuLT4OJn3Fvxo6jwLLtf9at5-MC2i"
+sessions = {}  # chat_id -> {step, zerops_token, client_id, tg_token, zen_key, bot_username, project_name, pid}
 
 
 def tg(method, payload=None):
@@ -65,12 +63,13 @@ services:
 """
 
 
-def build_hermes_yaml(tg_token, chat_id, router_url, router_key):
+def build_hermes_yaml(tg_token, chat_id, router_url, router_key, zen_key):
     dotenv = (
         f"NEW_TG_TOKEN={tg_token}\n"
         f"NEW_TG_CHAT={chat_id}\n"
         f"ROUTER_URL={router_url}\n"
         f"ROUTER_KEY={router_key}\n"
+        f"ZEN_KEY={zen_key}\n"
     )
     dg = "\n".join("      " + l for l in dotenv.strip().split("\n"))
     return f"""services:
@@ -158,13 +157,14 @@ def phase2_hermes(chat_id, s):
     send(chat_id, "⏳ لینک و کلید رو گرفتم، دارم هرمس رو نصب می‌کنم… (مرحله ۳ از ۳)")
     code, res = zapi(zt, "post", f"/project/{pid}/service-stack/import",
                      {"yaml": build_hermes_yaml(s["tg_token"], chat_id,
-                                                s.get("router_url", ""), s.get("router_key", ""))},
+                                                s.get("router_url", ""), s.get("router_key", ""),
+                                                s.get("zen_key", ""))},
                      timeout=120)
     if code != 200:
         send(chat_id, f"❌ ساخت سرویس هرمس ناموفق بود (HTTP {code}):\n<code>" +
              ihtml.escape(json.dumps(res)[:1500]) + "</code>")
         return
-    # inject zen key + allowlist into the new app service
+    # inject per-user zen key + allowlist into the new app service (no shared keys)
     try:
         _, stacks = zapi(zt, "get", f"/project/{pid}/service-stack", timeout=30)
         for st in (stacks.get("list", []) if isinstance(stacks, dict) else []):
@@ -172,7 +172,7 @@ def phase2_hermes(chat_id, s):
                 continue
             sid = st.get("id")
             zapi(zt, "post", f"/service-stack/{sid}/user-data",
-                 {"key": "OPENCODE_ZEN_API_KEY", "content": ZEN_KEY, "sensitive": True},
+                 {"key": "OPENCODE_ZEN_API_KEY", "content": s.get("zen_key", ""), "sensitive": True},
                  timeout=30)
             zapi(zt, "post", f"/service-stack/{sid}/user-data",
                  {"key": "TELEGRAM_ALLOWED_USERS", "content": str(chat_id), "sensitive": False},
@@ -239,8 +239,16 @@ def handle(chat_id, text):
         except Exception:
             pass
         s["tg_token"] = text
+        s["step"] = "zen"
+        send(chat_id, f"✅ بات @{s.get('bot_username', '?')} تایید شد.\n\nحالا کلید OpenCode Zen خودت رو بفرست (از https://opencode.ai/zen می‌گیری — هر نصب باید کلید خودش رو داشته باشه، هیچ کلید مشترکی استفاده نمیشه):")
+        return
+    if step == "zen":
+        if len(text) < 10 or " " in text:
+            send(chat_id, "❌ این شبیه کلید نیست. کلید zen رو دوباره بفرست (با oc_ شروع میشه):")
+            return
+        s["zen_key"] = text
         s["step"] = "name"
-        send(chat_id, f"✅ بات @{s.get('bot_username', '?')} تایید شد.\n\nاسم پروژه رو بفرست (فقط حروف کوچیک انگلیسی، مثل hermes2):")
+        send(chat_id, "✅ کلید zen گرفتم.\n\nاسم پروژه رو بفرست (فقط حروف کوچیک انگلیسی، مثل hermes2):")
         return
     if step == "name":
         name = re.sub(r"[^a-z0-9-]", "", text.lower())[:25] or "hermes-auto"
