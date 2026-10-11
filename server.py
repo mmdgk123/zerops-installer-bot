@@ -1,9 +1,9 @@
-import os, re, time, json, threading, html as ihtml, requests
+import os, re, secrets, time, json, threading, html as ihtml, requests
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 API_BASE = "https://api.app-prg1.zerops.io/api/rest/public"
 
-sessions = {}  # chat_id -> {step, zerops_token, client_id, tg_token, bot_username, project_name, pid}
+sessions = {}  # chat_id -> {step, zerops_token, client_id, tg_token, gemini_key, bot_username, project_name, pid, fcc_url, fcc_key}
 
 
 def tg(method, payload=None):
@@ -44,31 +44,37 @@ def hide(t):
     return t[:4] + "…" + t[-4:]
 
 
-def build_router_yaml(project):
+def build_fcc_yaml(project, gemini_key, proxy_token):
     return f"""project:
   name: {project}
-  description: "hermes + 9router auto install"
+  description: "hermes + FCC auto install"
   corePackage: LIGHT
 services:
-  - hostname: router
-    type: nodejs@22
+  - hostname: fcc
+    type: python@3.14
     enableSubdomainAccess: true
     minContainers: 1
     maxContainers: 1
     minRam: 1
-    maxRam: 1
+    maxRam: 2
     minCpu: 1
     maxCpu: 2
-    buildFromGit: https://github.com/mmdgk123/ninerouter-zerops
+    buildFromGit: https://github.com/mmdgk123/fcc-zerops
+    envSecrets:
+      GEMINI_API_KEY: '{gemini_key}'
+      MODEL: 'gemini/models/gemini-3.1-flash-lite'
+      PROXY_AUTH_ENABLED: 'true'
+      ANTHROPIC_AUTH_TOKEN: '{proxy_token}'
+      FCC_OPEN_BROWSER: 'false'
 """
 
 
-def build_hermes_yaml(tg_token, chat_id, router_url, router_key):
+def build_hermes_yaml(tg_token, chat_id, fcc_url, fcc_key):
     dotenv = (
         f"NEW_TG_TOKEN={tg_token}\n"
         f"NEW_TG_CHAT={chat_id}\n"
-        f"ROUTER_URL={router_url}\n"
-        f"ROUTER_KEY={router_key}\n"
+        f"FCC_URL={fcc_url}\n"
+        f"FCC_KEY={fcc_key}\n"
     )
     dg = "\n".join("      " + l for l in dotenv.strip().split("\n"))
     return f"""services:
@@ -101,18 +107,20 @@ def get_client_id(zt):
     return None
 
 
-def phase1_router(chat_id, s):
-    """Create project with router service only, watch it, then ask for API key."""
+def phase1_fcc(chat_id, s):
+    """Create project with FCC service, watch it, then add hermes."""
     zt = s["zerops_token"]
-    send(chat_id, "⏳ توکن معتبره، دارم 9router رو می‌سازم… (مرحله ۱ از ۲)")
+    send(chat_id, "⏳ توکن معتبره، دارم FCC رو می‌سازم… (مرحله ۱ از ۲)")
     client_id = get_client_id(zt)
     if not client_id:
         send(chat_id, "❌ نتونستم client-id رو پیدا کنم. با /start دوباره شروع کن.")
         sessions.pop(chat_id, None)
         return
     s["client_id"] = client_id
+    proxy_token = secrets.token_hex(32)
+    s["fcc_key"] = proxy_token
     code, res = zapi(zt, "post", f"/client/{client_id}/project/import",
-                     {"yaml": build_router_yaml(s["project_name"])}, timeout=120)
+                     {"yaml": build_fcc_yaml(s["project_name"], s["gemini_key"], proxy_token)}, timeout=120)
     if code != 200:
         send(chat_id, f"❌ ساخت پروژه ناموفق بود (HTTP {code}):\n<code>" +
              ihtml.escape(json.dumps(res)[:1500]) + "</code>")
@@ -120,11 +128,11 @@ def phase1_router(chat_id, s):
         return
     pid = res.get("projectId", "?")
     s["pid"] = pid
-    send(chat_id, f"✅ پروژه ساخته شد!\n🆔 <code>{ihtml.escape(str(pid))}</code>\n\n🔀 9router داره بیلد می‌گیره (~۵ دقیقه). وقتی بالا اومد لینک داشبورد رو میدم.")
-    threading.Thread(target=watch_router, args=(chat_id, zt, pid), daemon=True).start()
+    send(chat_id, f"✅ پروژه ساخته شد!\n🆔 <code>{ihtml.escape(str(pid))}</code>\n\n🔀 FCC داره بیلد می‌گیره (~۸ دقیقه، نصب runtime). وقتی بالا اومد هرمس رو اضافه می‌کنم.")
+    threading.Thread(target=watch_fcc, args=(chat_id, zt, pid), daemon=True).start()
 
 
-def watch_router(chat_id, token, pid, tries=40):
+def watch_fcc(chat_id, token, pid, tries=60):
     import time as _t
     for _ in range(tries):
         _t.sleep(60)
@@ -132,37 +140,52 @@ def watch_router(chat_id, token, pid, tries=40):
             _, data = zapi(token, "get", f"/project/{pid}/service-stack", timeout=30)
             items = data.get("list", []) if isinstance(data, dict) else []
             for sv in items:
-                if sv.get("isSystem") or sv.get("name") != "router":
+                if sv.get("isSystem") or sv.get("name") != "fcc":
                     continue
                 st = sv.get("status", "?")
                 if st in ("READY", "RUNNING", "OK", "ACTIVE") or "RUN" in st.upper():
-                    send(chat_id, f"🔀 9router بالا اومد!\n\nلینک داشبورد:\nhttps://app.zerops.io/project/{pid}\n(سرویس router → ساب‌دامین → /dashboard، پسورد اول: 123456)\n\n<b>مرحله ۲:</b> اول لینک لوکال 9router رو بفرست (ساب‌دامین سرویس router + /v1، مثل https://router-xxx.prg1.zerops.app/v1):")
+                    # find subdomain
+                    fcc_url = ""
+                    try:
+                        _, env = zapi(token, "get", f"/service-stack/{sv.get('id')}/env", timeout=30)
+                        for x in (env.get("items", []) if isinstance(env, dict) else []):
+                            if x.get("key") == "zeropsSubdomain":
+                                fcc_url = (x.get("content") or "").rstrip("/") + "/v1"
+                    except Exception:
+                        pass
                     s = sessions.get(chat_id)
-                    if s is not None:
-                        s["step"] = "rurl"
+                    if s is None:
+                        return
+                    if not fcc_url.startswith("http"):
+                        send(chat_id, "⚠️ FCC بالا اومد ولی ساب‌دامین رو پیدا نکردم. از داشبورد ساب‌دامین سرویس fcc رو بفرست (مثل https://fcc-xxx.prg1.zerops.app/v1):")
+                        s["step"] = "fccurl"
+                        return
+                    s["fcc_url"] = fcc_url
+                    s["step"] = "building_hermes"
+                    threading.Thread(target=phase2_hermes, args=(chat_id, dict(s)), daemon=True).start()
                     return
                 if "FAIL" in st.upper() or "ERROR" in st.upper():
-                    send(chat_id, f"❌ بیلد 9router خراب شد ({st}). لاگ رو تو داشبورد ببین.")
+                    send(chat_id, f"❌ بیلد FCC خراب شد ({st}). لاگ رو تو داشبورد ببین.")
                     sessions.pop(chat_id, None)
                     return
         except Exception:
             pass
-    send(chat_id, "⏰ 9router بالا نیومد. تو داشبورد چک کن:\nhttps://app.zerops.io/project/" + str(pid))
+    send(chat_id, "⏰ FCC بالا نیومد. تو داشبورد چک کن:\nhttps://app.zerops.io/project/" + str(pid))
 
 
 def phase2_hermes(chat_id, s):
-    """Import hermes service into the same project with the router URL+key."""
+    """Import hermes service into the same project with the FCC URL+key."""
     zt, pid = s["zerops_token"], s["pid"]
-    send(chat_id, "⏳ لینک و کلید رو گرفتم، دارم هرمس رو نصب می‌کنم… (مرحله ۳ از ۳)")
+    send(chat_id, "⏳ FCC بالاست، دارم هرمس رو نصب می‌کنم… (مرحله ۲ از ۲)")
     code, res = zapi(zt, "post", f"/project/{pid}/service-stack/import",
                      {"yaml": build_hermes_yaml(s["tg_token"], chat_id,
-                                                s.get("router_url", ""), s.get("router_key", ""))},
+                                                s.get("fcc_url", ""), s.get("fcc_key", ""))},
                      timeout=120)
     if code != 200:
         send(chat_id, f"❌ ساخت سرویس هرمس ناموفق بود (HTTP {code}):\n<code>" +
              ihtml.escape(json.dumps(res)[:1500]) + "</code>")
         return
-    # inject allowlist into the new app service (model comes from the router, no extra keys)
+    # inject allowlist into the new app service (model comes from FCC, no extra keys)
     try:
         _, stacks = zapi(zt, "get", f"/project/{pid}/service-stack", timeout=30)
         for st in (stacks.get("list", []) if isinstance(stacks, dict) else []):
@@ -234,35 +257,37 @@ def handle(chat_id, text):
         except Exception:
             pass
         s["tg_token"] = text
+        s["step"] = "gemini"
+        send(chat_id, f"✅ بات @{s.get('bot_username', '?')} تایید شد.\n\nحالا کلید Gemini خودت رو بفرست (از https://aistudio.google.com/apikey می‌گیری — رایگانه، هر نصب با کلید خودش کار می‌کنه):")
+        return
+    if step == "gemini":
+        if len(text) < 20 or " " in text:
+            send(chat_id, "❌ این شبیه کلید API نیست. دوباره بفرست:")
+            return
+        s["gemini_key"] = text
         s["step"] = "name"
-        send(chat_id, f"✅ بات @{s.get('bot_username', '?')} تایید شد.\n\nاسم پروژه رو بفرست (فقط حروف کوچیک انگلیسی، مثل hermes2):")
+        send(chat_id, "✅ کلید Gemini گرفتم.\n\nاسم پروژه رو بفرست (فقط حروف کوچیک انگلیسی، مثل hermes2):")
         return
     if step == "name":
         name = re.sub(r"[^a-z0-9-]", "", text.lower())[:25] or "hermes-auto"
         s["project_name"] = name
-        s["step"] = "building_router"
-        threading.Thread(target=phase1_router, args=(chat_id, dict(s)), daemon=True).start()
+        s["step"] = "building_fcc"
+        threading.Thread(target=phase1_fcc, args=(chat_id, dict(s)), daemon=True).start()
         # keep live session ref for step transition
         sessions[chat_id] = s
         return
-    if step == "rurl":
+    if step == "fccurl":
         url = text.strip().rstrip("/")
         if not url.startswith("http"):
             send(chat_id, "❌ لینک باید با http شروع بشه. دوباره بفرست:")
             return
-        s["router_url"] = url
-        s["step"] = "rkey"
-        send(chat_id, "✅ لینک گرفتم.\n\n<b>مرحله ۳:</b> حالا کلید API رو از داشبورد 9router بگیر (بخش API keys) و بفرست:")
-        return
-    if step == "rkey":
-        if len(text) < 10:
-            send(chat_id, "❌ این شبیه کلید API نیست. دوباره بفرست:")
-            return
-        s["router_key"] = text
+        if not url.endswith("/v1"):
+            url = url + "/v1"
+        s["fcc_url"] = url
         s["step"] = "building_hermes"
         threading.Thread(target=phase2_hermes, args=(chat_id, dict(s)), daemon=True).start()
         return
-    if step in ("building_router", "building_hermes"):
+    if step in ("building_fcc", "building_hermes"):
         send(chat_id, "⏳ صبر کن، دارم کار می‌کنم…")
         return
 
